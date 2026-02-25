@@ -149,7 +149,16 @@ async fn main() -> Result<()> {
     } else if let Some(pr) = args.pr {
         run_with_pr(&repo, pr, &config, &args).await
     } else {
-        run_with_pr_list(&repo, config, &args).await
+        match github::detect_current_branch_pr_number(&repo).await {
+            Ok(Some(pr)) => run_with_pr(&repo, pr, &config, &args).await,
+            Ok(None) => run_with_pr_list(&repo, config, &args).await,
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to detect current-branch PR ({e}). Falling back to PR list."
+                );
+                run_with_pr_list(&repo, config, &args).await
+            }
+        }
     }
 }
 
@@ -274,6 +283,10 @@ async fn run_with_pr(repo: &str, pr: u32, config: &config::Config, args: &Args) 
 
     // 常に Loading 状態で開始し、バックグラウンドで API 取得
     let (mut app, tx) = app::App::new_loading(repo, pr, config.clone());
+    let initial_fetch_mode = app
+        .warm_start_pr_from_disk_cache(pr)
+        .map(loader::FetchMode::CheckUpdate)
+        .unwrap_or(loader::FetchMode::Fresh);
 
     app.set_retry_sender(retry_tx);
     setup_working_dir(&mut app, args);
@@ -296,7 +309,7 @@ async fn run_with_pr(repo: &str, pr: u32, config: &config::Config, args: &Args) 
         tokio::select! {
             _ = token_clone.cancelled() => {}
             _ = async {
-                loader::fetch_pr_data(repo_clone.clone(), pr_number, loader::FetchMode::Fresh, tx.clone()).await;
+                loader::fetch_pr_data(repo_clone.clone(), pr_number, initial_fetch_mode, tx.clone()).await;
 
                 while let Some(request) = retry_rx.recv().await {
                     match request {

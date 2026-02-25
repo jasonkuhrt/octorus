@@ -140,6 +140,31 @@ pub async fn fetch_pr_diff(repo: &str, pr_number: u32) -> Result<String> {
 }
 
 #[derive(Debug, Deserialize)]
+struct CurrentBranchStatusResponse {
+    #[serde(rename = "currentBranch")]
+    current_branch: Option<CurrentBranchPr>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurrentBranchPr {
+    number: u32,
+}
+
+fn parse_current_branch_pr_number(output: &str) -> Result<Option<u32>> {
+    let status: CurrentBranchStatusResponse =
+        serde_json::from_str(output).context("Failed to parse current-branch PR status")?;
+    Ok(status.current_branch.map(|pr| pr.number))
+}
+
+/// Detect the PR number associated with the current git branch.
+///
+/// Returns `Ok(None)` when the current branch has no associated PR.
+pub async fn detect_current_branch_pr_number(repo: &str) -> Result<Option<u32>> {
+    let output = gh_command(&["pr", "status", "-R", repo, "--json", "currentBranch"]).await?;
+    parse_current_branch_pr_number(&output)
+}
+
+#[derive(Debug, Deserialize)]
 struct GraphqlPageInfo {
     #[serde(rename = "hasNextPage")]
     has_next_page: bool,
@@ -385,5 +410,25 @@ mod tests {
         assert_eq!(PrStateFilter::Open.next(), PrStateFilter::Closed);
         assert_eq!(PrStateFilter::Closed.next(), PrStateFilter::All);
         assert_eq!(PrStateFilter::All.next(), PrStateFilter::Open);
+    }
+
+    #[test]
+    fn test_parse_current_branch_pr_number_with_pr() {
+        let output = r#"{
+          "currentBranch": {
+            "number": 123
+          }
+        }"#;
+
+        assert_eq!(parse_current_branch_pr_number(output).unwrap(), Some(123));
+    }
+
+    #[test]
+    fn test_parse_current_branch_pr_number_without_pr() {
+        let output = r#"{
+          "currentBranch": null
+        }"#;
+
+        assert_eq!(parse_current_branch_pr_number(output).unwrap(), None);
     }
 }
