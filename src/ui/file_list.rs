@@ -45,37 +45,43 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // File list
     let files = app.files();
     let total_files = files.len();
-    let items = build_file_list_items(files, app.selected_file);
+    let visible_indices = app.visible_file_indices();
+    let visible_files = visible_indices.len();
+    let selected_visible = app.selected_visible_file_position(&visible_indices);
+    let items = build_file_list_items(files, &visible_indices, selected_visible);
+    let title = if app.is_hiding_viewed_files() {
+        format!("Changed Files ({}/{})", visible_files, total_files)
+    } else {
+        format!("Changed Files ({})", total_files)
+    };
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Changed Files ({})", total_files)),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().bg(Color::DarkGray));
 
     let mut list_state = ListState::default()
         .with_offset(app.file_list_scroll_offset)
-        .with_selected(Some(app.selected_file));
+        .with_selected(selected_visible);
 
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
     // Persist both offset and clamped selected index from ListState
     // (render_stateful_widget may clamp selected if list shrank)
     app.file_list_scroll_offset = list_state.offset();
-    if let Some(sel) = list_state.selected() {
-        app.selected_file = sel;
+    if let Some(sel_visible) = list_state.selected() {
+        if let Some(&real_index) = visible_indices.get(sel_visible) {
+            app.selected_file = real_index;
+        }
     }
 
     // Render scrollbar if there are more files than visible
-    if total_files > 1 {
+    if visible_files > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
 
-        let mut scrollbar_state =
-            ScrollbarState::new(total_files.saturating_sub(1)).position(app.selected_file);
+        let mut scrollbar_state = ScrollbarState::new(visible_files.saturating_sub(1))
+            .position(selected_visible.unwrap_or(0));
 
         frame.render_stateful_widget(
             scrollbar,
@@ -105,9 +111,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ai_rally_text
         )
     } else {
+        let viewed_filter_text = if app.is_hiding_viewed_files() {
+            "H: show viewed"
+        } else {
+            "H: hide viewed"
+        };
         format!(
-            "j/k/↑↓: move | Enter/→/l: split view | v: viewed | V: viewed dir | O: browser | a: approve | r: request changes | c: comment | C: comments | {} | R: refresh | q: quit | ?: help",
-            ai_rally_text
+            "j/k/↑↓: move | Enter/→/l: split view | v: toggle viewed | V: toggle dir viewed | {} | O: browser | a: approve | r: request changes | c: comment | C: comments | {} | R: refresh | q: quit | ?: help",
+            viewed_filter_text, ai_rally_text
         )
     };
     let footer_line = super::footer::build_footer_line(app, &help_text);
@@ -200,13 +211,15 @@ pub fn render_error(frame: &mut Frame, app: &App, error_msg: &str) {
 /// ファイル一覧のリストアイテムを構築する（side_by_side でも再利用）
 pub(crate) fn build_file_list_items<'a>(
     files: &'a [ChangedFile],
-    selected_file: usize,
+    visible_indices: &[usize],
+    selected_visible: Option<usize>,
 ) -> Vec<ListItem<'a>> {
-    files
+    visible_indices
         .iter()
         .enumerate()
-        .map(|(i, file)| {
-            let style = if i == selected_file {
+        .filter_map(|(visible_idx, &file_idx)| {
+            let file = files.get(file_idx)?;
+            let style = if Some(visible_idx) == selected_visible {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
@@ -243,7 +256,7 @@ pub(crate) fn build_file_list_items<'a>(
                 Span::raw(format!(" +{} -{}", file.additions, file.deletions)),
             ]);
 
-            ListItem::new(line)
+            Some(ListItem::new(line))
         })
         .collect()
 }

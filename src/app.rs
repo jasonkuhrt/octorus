@@ -280,7 +280,7 @@ pub enum RefreshRequest {
 #[derive(Debug, Clone)]
 enum MarkViewedResult {
     Completed {
-        marked_paths: Vec<String>,
+        updated_paths: Vec<(String, bool)>,
         total_targets: usize,
         error: Option<String>,
     },
@@ -446,6 +446,8 @@ pub struct App {
     pub symbol_popup: Option<SymbolPopupState>,
     /// インメモリセッションキャッシュ
     pub session_cache: SessionCache,
+    /// viewed 済みファイルを一覧から非表示にするか
+    hide_viewed_files: bool,
     /// Markdown リッチ表示モード（見出し太字・斜体等を適用）
     markdown_rich: bool,
 }
@@ -534,6 +536,7 @@ impl App {
             pending_since: None,
             symbol_popup: None,
             session_cache: SessionCache::new(),
+            hide_viewed_files: false,
             markdown_rich: false,
         };
 
@@ -617,6 +620,7 @@ impl App {
             watcher_handle: None,
             refresh_pending: None,
             session_cache: SessionCache::new(),
+            hide_viewed_files: false,
             markdown_rich: false,
         }
     }
@@ -1445,35 +1449,43 @@ impl App {
 
         match rx.try_recv() {
             Ok(MarkViewedResult::Completed {
-                marked_paths,
+                updated_paths,
                 total_targets,
                 error,
             }) => {
                 self.mark_viewed_receiver = None;
-                self.apply_viewed_state_to_files(&marked_paths);
+                self.apply_viewed_state_to_files(&updated_paths);
+                let updated_count = updated_paths.len();
+                let marked_viewed_count = updated_paths
+                    .iter()
+                    .filter(|(_, is_viewed)| *is_viewed)
+                    .count();
+                let marked_unviewed_count = updated_count.saturating_sub(marked_viewed_count);
 
                 match error {
                     Some(err) => {
-                        if marked_paths.is_empty() {
+                        if updated_count == 0 {
                             self.submission_result =
-                                Some((false, format!("Mark viewed failed: {}", err)));
+                                Some((false, format!("Viewed-state update failed: {}", err)));
                         } else {
                             self.submission_result = Some((
                                 false,
                                 format!(
-                                    "Marked {}/{} files, then failed: {}",
-                                    marked_paths.len(),
-                                    total_targets,
-                                    err
+                                    "Updated {}/{} files, then failed: {}",
+                                    updated_count, total_targets, err
                                 ),
                             ));
                         }
                     }
                     None => {
-                        self.submission_result = Some((
-                            true,
-                            format!("Marked {} file(s) as viewed", marked_paths.len()),
-                        ));
+                        let message = if marked_viewed_count > 0 && marked_unviewed_count > 0 {
+                            format!("Updated viewed state for {} file(s)", updated_count)
+                        } else if marked_unviewed_count > 0 {
+                            format!("Marked {} file(s) as unviewed", marked_unviewed_count)
+                        } else {
+                            format!("Marked {} file(s) as viewed", marked_viewed_count)
+                        };
+                        self.submission_result = Some((true, message));
                     }
                 }
                 self.submission_result_time = Some(Instant::now());
@@ -1485,18 +1497,36 @@ impl App {
         }
     }
 
-    fn apply_viewed_state_to_files(&mut self, marked_paths: &[String]) {
-        if marked_paths.is_empty() {
+    fn apply_viewed_state_to_files(&mut self, updated_paths: &[(String, bool)]) {
+        if updated_paths.is_empty() {
             return;
         }
 
-        let marked_set: HashSet<&str> = marked_paths.iter().map(|path| path.as_str()).collect();
+        let old_selected = self.selected_file;
+        let updated_map: HashMap<&str, bool> = updated_paths
+            .iter()
+            .map(|(path, viewed)| (path.as_str(), *viewed))
+            .collect();
+
         if let DataState::Loaded { files, .. } = &mut self.data_state {
             for file in files.iter_mut() {
-                if marked_set.contains(file.filename.as_str()) {
-                    file.viewed = true;
+                if let Some(next_viewed) = updated_map.get(file.filename.as_str()) {
+                    file.viewed = *next_viewed;
                 }
             }
+        }
+
+        self.ensure_selected_file_visible();
+        self.clamp_file_list_scroll_offset_to_selection();
+        if self.selected_file != old_selected
+            && matches!(
+                self.state,
+                AppState::DiffView | AppState::SplitViewFileList | AppState::SplitViewDiff
+            )
+        {
+            self.sync_diff_to_selected_file();
+        } else {
+            self.update_diff_line_count();
         }
 
         self.sync_loaded_data_to_cache();
@@ -1704,8 +1734,8 @@ impl App {
 
                 self.selected_file = next_selected;
                 if changed_file_index.is_some() {
-                    self.file_list_scroll_offset =
-                        self.file_list_scroll_offset.min(self.selected_file);
+                    self.ensure_selected_file_visible();
+                    self.clamp_file_list_scroll_offset_to_selection();
 
                     // BG rally 中は state 遷移をスキップ（ファイル選択のみ更新）
                     let rally_running_in_bg = self
@@ -1722,8 +1752,8 @@ impl App {
                     }
                     self.sync_diff_to_selected_file();
                 } else {
-                    self.file_list_scroll_offset =
-                        self.file_list_scroll_offset.min(self.selected_file);
+                    self.ensure_selected_file_visible();
+                    self.clamp_file_list_scroll_offset_to_selection();
                 }
                 self.diff_line_count = Self::calc_diff_line_count(&files, self.selected_file);
                 // ファイル一覧が変わるため、ハイライトキャッシュストアをクリア
@@ -1874,6 +1904,96 @@ impl App {
         }
     }
 
+    pub fn is_hiding_viewed_files(&self) -> bool {
+        self.hide_viewed_files
+    }
+
+    pub fn visible_file_indices(&self) -> Vec<usize> {
+        self.files()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, file)| {
+                if self.hide_viewed_files && file.viewed {
+                    None
+                } else {
+                    Some(idx)
+                }
+            })
+            .collect()
+    }
+
+    pub fn selected_visible_file_position(&self, visible_indices: &[usize]) -> Option<usize> {
+        Self::visible_position_for_selected(visible_indices, self.selected_file)
+    }
+
+    fn visible_position_for_selected(
+        visible_indices: &[usize],
+        selected_file: usize,
+    ) -> Option<usize> {
+        if visible_indices.is_empty() {
+            return None;
+        }
+
+        Some(match visible_indices.binary_search(&selected_file) {
+            Ok(pos) => pos,
+            Err(insert) if insert < visible_indices.len() => insert,
+            Err(_) => visible_indices.len() - 1,
+        })
+    }
+
+    fn has_visible_files(&self) -> bool {
+        self.selected_visible_file_position(&self.visible_file_indices())
+            .is_some()
+    }
+
+    fn ensure_selected_file_visible(&mut self) -> bool {
+        let visible_indices = self.visible_file_indices();
+        let Some(visible_pos) = self.selected_visible_file_position(&visible_indices) else {
+            self.selected_file = self.files().len();
+            return false;
+        };
+
+        if let Some(&next_selected) = visible_indices.get(visible_pos) {
+            self.selected_file = next_selected;
+            return true;
+        }
+
+        self.selected_file = self.files().len();
+        false
+    }
+
+    fn clamp_file_list_scroll_offset_to_selection(&mut self) {
+        let visible_indices = self.visible_file_indices();
+        let selected_visible = self
+            .selected_visible_file_position(&visible_indices)
+            .unwrap_or(0);
+        self.file_list_scroll_offset = self.file_list_scroll_offset.min(selected_visible);
+    }
+
+    fn move_file_selection_by(&mut self, step: isize) -> bool {
+        let visible_indices = self.visible_file_indices();
+        let Some(current_pos) = self.selected_visible_file_position(&visible_indices) else {
+            return false;
+        };
+
+        let max_pos = visible_indices.len().saturating_sub(1);
+        let next_pos = if step >= 0 {
+            current_pos.saturating_add(step as usize).min(max_pos)
+        } else {
+            current_pos.saturating_sub(step.unsigned_abs())
+        };
+
+        let Some(&next_selected) = visible_indices.get(next_pos) else {
+            return false;
+        };
+        if next_selected == self.selected_file {
+            return false;
+        }
+
+        self.selected_file = next_selected;
+        true
+    }
+
     pub fn pr(&self) -> Option<&PullRequest> {
         match &self.data_state {
             DataState::Loaded { pr, .. } => Some(pr.as_ref()),
@@ -1974,27 +2094,21 @@ impl App {
 
         // Move down (j or Down arrow - arrows always work)
         if self.matches_single_key(&key, &kb.move_down) || key.code == KeyCode::Down {
-            if !self.files().is_empty() {
-                self.selected_file =
-                    (self.selected_file + 1).min(self.files().len().saturating_sub(1));
-            }
+            self.move_file_selection_by(1);
             return Ok(());
         }
 
         // Move up (k or Up arrow)
         if self.matches_single_key(&key, &kb.move_up) || key.code == KeyCode::Up {
-            self.selected_file = self.selected_file.saturating_sub(1);
+            self.move_file_selection_by(-1);
             return Ok(());
         }
 
         // Page down (Ctrl-d by default, also J)
         if self.matches_single_key(&key, &kb.page_down) || Self::is_shift_char_shortcut(&key, 'j') {
-            if !self.files().is_empty() {
-                let page_step = terminal.size()?.height.saturating_sub(8) as usize;
-                let step = page_step.max(1);
-                self.selected_file =
-                    (self.selected_file + step).min(self.files().len().saturating_sub(1));
-            }
+            let page_step = terminal.size()?.height.saturating_sub(8) as usize;
+            let step = page_step.max(1);
+            self.move_file_selection_by(step as isize);
             return Ok(());
         }
 
@@ -2002,7 +2116,7 @@ impl App {
         if self.matches_single_key(&key, &kb.page_up) || Self::is_shift_char_shortcut(&key, 'k') {
             let page_step = terminal.size()?.height.saturating_sub(8) as usize;
             let step = page_step.max(1);
-            self.selected_file = self.selected_file.saturating_sub(step);
+            self.move_file_selection_by(-(step as isize));
             return Ok(());
         }
 
@@ -2011,7 +2125,7 @@ impl App {
             || self.matches_single_key(&key, &kb.move_right)
             || key.code == KeyCode::Right
         {
-            if !self.files().is_empty() {
+            if self.has_visible_files() {
                 self.state = AppState::SplitViewDiff;
                 self.sync_diff_to_selected_file();
             }
@@ -2154,64 +2268,113 @@ impl App {
     }
 
     fn handle_mark_viewed_key(&mut self, key: event::KeyEvent) -> bool {
+        if Self::is_shift_char_shortcut(&key, 'h') {
+            self.toggle_hide_viewed_files();
+            return true;
+        }
+
         if self.local_mode {
             return false;
         }
 
-        let is_mark_file = key.code == KeyCode::Char('v')
+        let is_toggle_file = key.code == KeyCode::Char('v')
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT);
-        let is_mark_directory = key.code == KeyCode::Char('V')
+        let is_toggle_directory = key.code == KeyCode::Char('V')
             || (key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::SHIFT));
         let has_unexpected_modifiers = key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::ALT);
 
-        if has_unexpected_modifiers || (!is_mark_file && !is_mark_directory) {
+        if has_unexpected_modifiers || (!is_toggle_file && !is_toggle_directory) {
             return false;
         }
 
         if self.mark_viewed_receiver.is_some() {
-            self.submission_result = Some((false, "Mark viewed already in progress".to_string()));
+            self.submission_result =
+                Some((false, "Viewed-state update already in progress".to_string()));
             self.submission_result_time = Some(Instant::now());
             return true;
         }
 
-        if is_mark_file {
-            self.start_mark_selected_file_as_viewed();
+        if is_toggle_file {
+            self.start_toggle_selected_file_viewed();
             return true;
         }
 
-        self.start_mark_selected_directory_as_viewed();
+        self.start_toggle_selected_directory_viewed();
         true
     }
 
-    fn start_mark_selected_file_as_viewed(&mut self) {
+    fn toggle_hide_viewed_files(&mut self) {
+        self.hide_viewed_files = !self.hide_viewed_files;
+
+        let old_selected = self.selected_file;
+        let has_visible = self.ensure_selected_file_visible();
+        self.clamp_file_list_scroll_offset_to_selection();
+
+        if !has_visible {
+            self.diff_cache = None;
+            self.diff_cache_receiver = None;
+            self.selected_line = 0;
+            self.scroll_offset = 0;
+            self.comment_panel_open = false;
+            self.comment_panel_scroll = 0;
+            self.update_diff_line_count();
+            self.update_file_comment_positions();
+        } else if self.selected_file != old_selected
+            && matches!(
+                self.state,
+                AppState::DiffView | AppState::SplitViewFileList | AppState::SplitViewDiff
+            )
+        {
+            self.sync_diff_to_selected_file();
+        } else {
+            self.update_diff_line_count();
+        }
+
+        let visible_count = self.visible_file_indices().len();
+        let total_count = self.files().len();
+        let message = if self.hide_viewed_files {
+            format!(
+                "Hiding viewed files ({}/{} shown)",
+                visible_count, total_count
+            )
+        } else {
+            format!("Showing viewed files ({} total)", total_count)
+        };
+        self.submission_result = Some((true, message));
+        self.submission_result_time = Some(Instant::now());
+    }
+
+    fn start_toggle_selected_file_viewed(&mut self) {
         let Some(file) = self.files().get(self.selected_file) else {
             return;
         };
-        if file.viewed {
-            self.submission_result = Some((true, "File is already marked as viewed".to_string()));
+
+        self.start_set_paths_viewed_state(vec![(file.filename.clone(), !file.viewed)]);
+    }
+
+    fn start_toggle_selected_directory_viewed(&mut self) {
+        let directory_files = Self::collect_directory_paths(self.files(), self.selected_file);
+        if directory_files.is_empty() {
+            self.submission_result = Some((true, "No files found in directory scope".to_string()));
             self.submission_result_time = Some(Instant::now());
             return;
         }
 
-        self.start_mark_paths_as_viewed(vec![file.filename.clone()]);
+        let all_viewed = directory_files.iter().all(|(_, viewed)| *viewed);
+        let target_viewed = !all_viewed;
+        let target_paths: Vec<(String, bool)> = directory_files
+            .into_iter()
+            .filter(|(_, viewed)| *viewed != target_viewed)
+            .map(|(path, _)| (path, target_viewed))
+            .collect();
+
+        self.start_set_paths_viewed_state(target_paths);
     }
 
-    fn start_mark_selected_directory_as_viewed(&mut self) {
-        let target_paths = Self::collect_unviewed_directory_paths(self.files(), self.selected_file);
-
-        if target_paths.is_empty() {
-            self.submission_result = Some((true, "No unviewed files in directory".to_string()));
-            self.submission_result_time = Some(Instant::now());
-            return;
-        }
-
-        self.start_mark_paths_as_viewed(target_paths);
-    }
-
-    fn start_mark_paths_as_viewed(&mut self, paths: Vec<String>) {
+    fn start_set_paths_viewed_state(&mut self, paths: Vec<(String, bool)>) {
         let total_targets = paths.len();
         if total_targets == 0 {
             return;
@@ -2231,19 +2394,34 @@ impl App {
         let repo = self.repo.clone();
         let (tx, rx) = mpsc::channel(1);
         self.mark_viewed_receiver = Some(rx);
-        self.submission_result = Some((
-            true,
-            format!("Marking {} file(s) as viewed...", total_targets),
-        ));
+        let mark_count = paths
+            .iter()
+            .filter(|(_, target_viewed)| *target_viewed)
+            .count();
+        let unmark_count = total_targets.saturating_sub(mark_count);
+        let message = if mark_count > 0 && unmark_count > 0 {
+            format!("Updating viewed state for {} file(s)...", total_targets)
+        } else if unmark_count > 0 {
+            format!("Marking {} file(s) as unviewed...", unmark_count)
+        } else {
+            format!("Marking {} file(s) as viewed...", mark_count)
+        };
+        self.submission_result = Some((true, message));
         self.submission_result_time = Some(Instant::now());
 
         tokio::spawn(async move {
-            let mut marked_paths = Vec::with_capacity(total_targets);
+            let mut updated_paths = Vec::with_capacity(total_targets);
             let mut error = None;
 
-            for path in paths {
-                match github::mark_file_as_viewed(&repo, &pr_node_id, &path).await {
-                    Ok(()) => marked_paths.push(path),
+            for (path, target_viewed) in paths {
+                let result = if target_viewed {
+                    github::mark_file_as_viewed(&repo, &pr_node_id, &path).await
+                } else {
+                    github::unmark_file_as_viewed(&repo, &pr_node_id, &path).await
+                };
+
+                match result {
+                    Ok(()) => updated_paths.push((path, target_viewed)),
                     Err(e) => {
                         error = Some(format!("{}: {}", path, e));
                         break;
@@ -2253,7 +2431,7 @@ impl App {
 
             let _ = tx
                 .send(MarkViewedResult::Completed {
-                    marked_paths,
+                    updated_paths,
                     total_targets,
                     error,
                 })
@@ -2261,16 +2439,18 @@ impl App {
         });
     }
 
-    fn directory_prefix_for(path: &str) -> String {
-        path.rsplit_once('/')
-            .map(|(dir, _)| format!("{}/", dir))
-            .unwrap_or_default()
+    fn directory_prefix_for(path: &str) -> Option<String> {
+        path.rsplit_once('/').map(|(dir, _)| format!("{dir}/"))
     }
 
-    fn collect_unviewed_directory_paths(
-        files: &[ChangedFile],
-        selected_file: usize,
-    ) -> Vec<String> {
+    fn path_matches_directory_scope(path: &str, directory_prefix: Option<&str>) -> bool {
+        match directory_prefix {
+            Some(prefix) => path.starts_with(prefix),
+            None => !path.contains('/'),
+        }
+    }
+
+    fn collect_directory_paths(files: &[ChangedFile], selected_file: usize) -> Vec<(String, bool)> {
         let Some(selected) = files.get(selected_file) else {
             return Vec::new();
         };
@@ -2278,8 +2458,10 @@ impl App {
 
         files
             .iter()
-            .filter(|file| file.filename.starts_with(&directory_prefix) && !file.viewed)
-            .map(|file| file.filename.clone())
+            .filter(|file| {
+                Self::path_matches_directory_scope(&file.filename, directory_prefix.as_deref())
+            })
+            .map(|file| (file.filename.clone(), file.viewed))
             .collect()
     }
 
@@ -2292,9 +2474,7 @@ impl App {
 
         // Move down
         if self.matches_single_key(&key, &kb.move_down) || key.code == KeyCode::Down {
-            if !self.files().is_empty() {
-                self.selected_file =
-                    (self.selected_file + 1).min(self.files().len().saturating_sub(1));
+            if self.move_file_selection_by(1) {
                 self.sync_diff_to_selected_file();
             }
             return Ok(());
@@ -2302,8 +2482,7 @@ impl App {
 
         // Move up
         if self.matches_single_key(&key, &kb.move_up) || key.code == KeyCode::Up {
-            if self.selected_file > 0 {
-                self.selected_file = self.selected_file.saturating_sub(1);
+            if self.move_file_selection_by(-1) {
                 self.sync_diff_to_selected_file();
             }
             return Ok(());
@@ -2311,11 +2490,9 @@ impl App {
 
         // Page down (Ctrl-d by default, also J)
         if self.matches_single_key(&key, &kb.page_down) || Self::is_shift_char_shortcut(&key, 'j') {
-            if !self.files().is_empty() {
-                let page_step = terminal.size()?.height.saturating_sub(8) as usize;
-                let step = page_step.max(1);
-                self.selected_file =
-                    (self.selected_file + step).min(self.files().len().saturating_sub(1));
+            let page_step = terminal.size()?.height.saturating_sub(8) as usize;
+            let step = page_step.max(1);
+            if self.move_file_selection_by(step as isize) {
                 self.sync_diff_to_selected_file();
             }
             return Ok(());
@@ -2325,8 +2502,9 @@ impl App {
         if self.matches_single_key(&key, &kb.page_up) || Self::is_shift_char_shortcut(&key, 'k') {
             let page_step = terminal.size()?.height.saturating_sub(8) as usize;
             let step = page_step.max(1);
-            self.selected_file = self.selected_file.saturating_sub(step);
-            self.sync_diff_to_selected_file();
+            if self.move_file_selection_by(-(step as isize)) {
+                self.sync_diff_to_selected_file();
+            }
             return Ok(());
         }
 
@@ -2335,7 +2513,7 @@ impl App {
             || self.matches_single_key(&key, &kb.move_right)
             || key.code == KeyCode::Right
         {
-            if !self.files().is_empty() {
+            if self.has_visible_files() {
                 self.state = AppState::SplitViewDiff;
             }
             return Ok(());
@@ -4914,6 +5092,7 @@ impl App {
             pending_since: None,
             symbol_popup: None,
             session_cache: SessionCache::new(),
+            hide_viewed_files: false,
             local_mode: false,
             local_auto_focus: false,
             local_file_signatures: HashMap::new(),
@@ -6210,7 +6389,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_unviewed_directory_paths_selected_prefix() {
+    fn test_collect_directory_paths_selected_prefix() {
         let files = vec![
             ChangedFile {
                 filename: "src/main.rs".to_string(),
@@ -6246,15 +6425,19 @@ mod tests {
             },
         ];
 
-        let paths = App::collect_unviewed_directory_paths(&files, 0);
+        let paths = App::collect_directory_paths(&files, 0);
         assert_eq!(
             paths,
-            vec!["src/main.rs".to_string(), "src/utils/mod.rs".to_string()]
+            vec![
+                ("src/main.rs".to_string(), false),
+                ("src/lib.rs".to_string(), true),
+                ("src/utils/mod.rs".to_string(), false),
+            ]
         );
     }
 
     #[test]
-    fn test_collect_unviewed_directory_paths_root_prefix_matches_all() {
+    fn test_collect_directory_paths_root_scope_matches_root_files_only() {
         let files = vec![
             ChangedFile {
                 filename: "README.md".to_string(),
@@ -6282,11 +6465,125 @@ mod tests {
             },
         ];
 
-        let paths = App::collect_unviewed_directory_paths(&files, 0);
+        let paths = App::collect_directory_paths(&files, 0);
         assert_eq!(
             paths,
-            vec!["README.md".to_string(), "src/main.rs".to_string()]
+            vec![
+                ("README.md".to_string(), false),
+                ("Cargo.toml".to_string(), true),
+            ]
         );
+    }
+
+    #[test]
+    fn test_visible_file_indices_filters_viewed_when_hide_enabled() {
+        let mut app = App::new_for_test();
+        app.data_state = DataState::Loaded {
+            pr: Box::new(make_local_pr()),
+            files: vec![
+                ChangedFile {
+                    filename: "src/a.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: Some("@@ -1 +1 @@\n+test".to_string()),
+                    viewed: true,
+                },
+                ChangedFile {
+                    filename: "src/b.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: Some("@@ -1 +1 @@\n+test".to_string()),
+                    viewed: false,
+                },
+                ChangedFile {
+                    filename: "src/c.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: Some("@@ -1 +1 @@\n+test".to_string()),
+                    viewed: true,
+                },
+            ],
+        };
+
+        assert_eq!(app.visible_file_indices(), vec![0, 1, 2]);
+
+        app.hide_viewed_files = true;
+        assert_eq!(app.visible_file_indices(), vec![1]);
+    }
+
+    #[test]
+    fn test_ensure_selected_file_visible_skips_hidden_selected_file() {
+        let mut app = App::new_for_test();
+        app.data_state = DataState::Loaded {
+            pr: Box::new(make_local_pr()),
+            files: vec![
+                ChangedFile {
+                    filename: "src/a.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: Some("@@ -1 +1 @@\n+test".to_string()),
+                    viewed: true,
+                },
+                ChangedFile {
+                    filename: "src/b.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: Some("@@ -1 +1 @@\n+test".to_string()),
+                    viewed: false,
+                },
+            ],
+        };
+        app.hide_viewed_files = true;
+        app.selected_file = 0; // hidden file
+
+        assert!(app.ensure_selected_file_visible());
+        assert_eq!(app.selected_file, 1);
+    }
+
+    #[test]
+    fn test_move_file_selection_by_uses_visible_indices_when_hiding_viewed() {
+        let mut app = App::new_for_test();
+        app.data_state = DataState::Loaded {
+            pr: Box::new(make_local_pr()),
+            files: vec![
+                ChangedFile {
+                    filename: "src/a.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: Some("@@ -1 +1 @@\n+test".to_string()),
+                    viewed: false,
+                },
+                ChangedFile {
+                    filename: "src/b.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: Some("@@ -1 +1 @@\n+test".to_string()),
+                    viewed: true,
+                },
+                ChangedFile {
+                    filename: "src/c.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: Some("@@ -1 +1 @@\n+test".to_string()),
+                    viewed: false,
+                },
+            ],
+        };
+        app.hide_viewed_files = true;
+        app.selected_file = 0;
+
+        assert!(app.move_file_selection_by(1));
+        assert_eq!(app.selected_file, 2);
+        assert!(app.move_file_selection_by(-1));
+        assert_eq!(app.selected_file, 0);
     }
 
     #[tokio::test]

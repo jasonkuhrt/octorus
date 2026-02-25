@@ -66,8 +66,13 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
             "{}  Open split view",
             fmt_key(&kb.open_panel.display(), key_width)
         )),
-        Line::from("  v               Mark selected file as viewed"),
-        Line::from("  V               Mark selected directory as viewed"),
+        Line::from("  v               Toggle selected file viewed state"),
+        Line::from("  V               Toggle selected directory viewed state"),
+        Line::from("  H               Hide/show viewed files in file list"),
+        Line::from(vec![Span::styled(
+            "                  (V uses selected file's directory prefix; root files toggle together)",
+            Style::default().fg(Color::DarkGray),
+        )]),
         Line::from(format!(
             "{}  Approve PR",
             fmt_key(&kb.approve.display(), key_width)
@@ -137,6 +142,9 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
             kb.move_left.display(),
             kb.quit.display()
         )),
+        Line::from("  v               Toggle selected file viewed state"),
+        Line::from("  V               Toggle selected directory viewed state"),
+        Line::from("  H               Hide/show viewed files in file list"),
         Line::from(vec![Span::styled(
             "  Diff Focus:",
             Style::default().fg(Color::DarkGray),

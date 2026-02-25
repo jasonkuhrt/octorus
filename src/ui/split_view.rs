@@ -93,38 +93,48 @@ fn render_file_list_pane(
     // File list
     let files = app.files();
     let total_files = files.len();
-    let items = build_file_list_items(files, app.selected_file);
+    let visible_indices = app.visible_file_indices();
+    let visible_files = visible_indices.len();
+    let selected_visible = app.selected_visible_file_position(&visible_indices);
+    let items = build_file_list_items(files, &visible_indices, selected_visible);
+    let title = if app.is_hiding_viewed_files() {
+        format!("Files ({}/{})", visible_files, total_files)
+    } else {
+        format!("Files ({})", total_files)
+    };
 
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border_color))
-                .title(format!("Files ({})", total_files)),
+                .title(title),
         )
         .highlight_style(Style::default().bg(Color::DarkGray));
 
     let mut list_state = ListState::default()
         .with_offset(app.file_list_scroll_offset)
-        .with_selected(Some(app.selected_file));
+        .with_selected(selected_visible);
 
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
     // Persist both offset and clamped selected index from ListState
     // (render_stateful_widget may clamp selected if list shrank)
     app.file_list_scroll_offset = list_state.offset();
-    if let Some(sel) = list_state.selected() {
-        app.selected_file = sel;
+    if let Some(sel_visible) = list_state.selected() {
+        if let Some(&real_index) = visible_indices.get(sel_visible) {
+            app.selected_file = real_index;
+        }
     }
 
     // Render scrollbar if there are more files than visible
-    if total_files > 1 {
+    if visible_files > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
 
-        let mut scrollbar_state =
-            ScrollbarState::new(total_files.saturating_sub(1)).position(app.selected_file);
+        let mut scrollbar_state = ScrollbarState::new(visible_files.saturating_sub(1))
+            .position(selected_visible.unwrap_or(0));
 
         frame.render_stateful_widget(
             scrollbar,
@@ -138,7 +148,13 @@ fn render_file_list_pane(
 
     // Footer
     let help_text = if is_focused {
-        "j/k/↑↓: move | Enter/→/l: diff | O: browser | ←/h/q: back"
+        if app.is_local_mode() {
+            "j/k/↑↓: move | Enter/→/l: diff | ←/h/q: back"
+        } else if app.is_hiding_viewed_files() {
+            "j/k/↑↓: move | Enter/→/l: diff | v: toggle viewed | V: toggle dir viewed | H: show viewed | O: browser | ←/h/q: back"
+        } else {
+            "j/k/↑↓: move | Enter/→/l: diff | v: toggle viewed | V: toggle dir viewed | H: hide viewed | O: browser | ←/h/q: back"
+        }
     } else {
         "←/h: focus files"
     };
